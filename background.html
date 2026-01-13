@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <title>Jelly</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #0d0d0d; display: flex; justify-content: center; align-items: center; }
+        #ui { position: absolute; bottom: 30px; color: rgba(255,255,255,0.8); font-family: sans-serif; pointer-events: none; letter-spacing: 1px; font-size: 14px; text-shadow: 0 2px 4px rgba(0,0,0,0.8); }
+    </style>
+</head>
+<body>
+<div id="ui">Jelly</div>
+
+<script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.172.0/build/three.module.js"
+    }
+  }
+</script>
+
+<script type="module">
+    import * as THREE from 'three';
+
+    const CONFIG = {
+        tension: 0.18,          // 張力 (回彈更有力)
+        friction: 0.90,         // 摩擦力
+        influenceRadius: 0.7,   // 影響範圍
+        maxDisplacement: 0.25,  // 允許更大的位移，因為背景是完美的，不會破圖
+    };
+
+    const vertexShader = `
+        varying vec2 vUv;
+        void main() {
+            vUv = uv;
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+    `;
+
+    const fragmentShader = `
+        uniform sampler2D uTexJelly;    // 果凍圖 (wallpaper.jpg)
+        uniform sampler2D uTexBg;       // 背景圖 (wallpaper2.png)
+        uniform sampler2D uMask;        // 遮罩 (mask.png)
+        
+        uniform vec2 uOffset;           // 物理位移
+        uniform vec2 uCenter;           // 抓取中心
+        uniform float uRatio;           // 圖片長寬比
+        uniform float uRadius;          // 變形半徑
+
+        varying vec2 vUv;
+
+        void main() {
+            // --- 1. 計算變形 UV (Distorted UV) ---
+            // 這些計算是為了決定「果凍」和「遮罩」要怎麼動
+            
+            vec2 aspectUV = vUv * vec2(uRatio, 1.0);
+            vec2 aspectCenter = uCenter * vec2(uRatio, 1.0);
+            float dist = distance(aspectUV, aspectCenter);
+            
+            // 越靠近抓取點，影響越大
+            float strength = smoothstep(uRadius, 0.0, dist);
+            
+            // 計算扭曲後的座標
+            // 注意：這裡是 vUv 減去偏移量，實現「拉動」的效果
+            vec2 distortedUV = vUv - (uOffset * strength);
+
+
+            // --- 2. 採樣 (Sampling) ---
+            
+            // A. 讀取背景 (使用 原始 UV) -> 永遠不動
+            vec4 colorBg = texture2D(uTexBg, vUv);
+            
+            // B. 讀取果凍 (使用 變形 UV) -> 會晃動
+            vec4 colorJelly = texture2D(uTexJelly, distortedUV);
+            
+            // C. 讀取遮罩 (使用 變形 UV) -> 遮罩形狀也會跟著扭曲！
+            float alpha = texture2D(uMask, distortedUV).r;
+
+            // --- 3. 邊緣處理 (Edge Cleanup) ---
+            
+            // 讓遮罩邊緣稍微平滑一點 (Anti-aliasing)
+            alpha = smoothstep(0.1, 0.9, alpha);
+
+            // 防止 UV 跑出 0~1 範圍導致貼圖重複或錯誤
+            // 如果變形後的 UV 超出邊界，我們強制把 Alpha 設為 0 (只顯示背景)
+            if (distortedUV.x < 0.0 || distortedUV.x > 1.0 || distortedUV.y < 0.0 || distortedUV.y > 1.0) {
+                alpha = 0.0;
+            }
+
+            // --- 4. 合成 (Compositing) ---
+            
+            // mix(背景, 果凍, 遮罩透明度)
+            // 當 alpha = 1 (果凍中心)，顯示 distorted jelly
+            // 當 alpha = 0 (盤子區域)，顯示 static background
+            // 當果凍移動後，alpha 位置也變了，露出的區域自然顯示背景
+            gl_FragColor = mix(colorBg, colorJelly, alpha);
+        }
+    `;
+
+    let scene, camera, renderer, plane, material;
+    let isDragging = false;
+    let startUV = new THREE.Vector2(0.5, 0.5);
+    let mouseOffset = new THREE.Vector2(0, 0);
+    let physicsPos = new THREE.Vector2(0, 0);
+    let physicsVel = new THREE.Vector2(0, 0);
+
+    init();
+
+    async function init() {
+        scene = new THREE.Scene();
+        const aspect = window.innerWidth / window.innerHeight;
+        camera = new THREE.OrthographicCamera(-5 * aspect, 5 * aspect, 5, -5, 0.1, 100);
+        camera.position.z = 10;
+
+        renderer = new THREE.WebGLRenderer({ antialias: false });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        const loader = new THREE.TextureLoader();
+        
+        // 載入三張圖片
+        const [texJelly, texMask, texBg] = await Promise.all([
+            loader.loadAsync('./wallpaper.jpg'),   // 果凍原圖
+            loader.loadAsync('./mask.png'),        // 遮罩
+            loader.loadAsync('./wallpaper2.png')   // 空盤子背景
+        ]);
+
+        // 設定紋理參數
+        [texJelly, texMask, texBg].forEach(t => {
+            t.wrapS = THREE.ClampToEdgeWrapping;
+            t.wrapT = THREE.ClampToEdgeWrapping;
+            t.minFilter = THREE.LinearFilter;
+            t.magFilter = THREE.LinearFilter;
+        });
+
+        const imgAspect = texJelly.image.width / texJelly.image.height;
+        const geometry = new THREE.PlaneGeometry(8 * imgAspect, 8, 1, 1);
+
+        material = new THREE.ShaderMaterial({
+            vertexShader: vertexShader,
+            fragmentShader: fragmentShader,
+            uniforms: {
+                uTexJelly: { value: texJelly },
+                uTexBg: { value: texBg },
+                uMask: { value: texMask },
+                
+                uOffset: { value: new THREE.Vector2(0, 0) },
+                uCenter: { value: new THREE.Vector2(0.5, 0.5) },
+                uRatio: { value: imgAspect },
+                uRadius: { value: CONFIG.influenceRadius }
+            }
+        });
+
+        plane = new THREE.Mesh(geometry, material);
+        scene.add(plane);
+
+        // --- 互動邏輯 (保持不變) ---
+        const raycaster = new THREE.Raycaster();
+        
+        window.addEventListener('mousedown', (e) => {
+            updateRaycaster(e, raycaster);
+            const intersects = raycaster.intersectObject(plane);
+            if (intersects.length > 0) {
+                isDragging = true;
+                startUV.copy(intersects[0].uv);
+                material.uniforms.uCenter.value.copy(startUV);
+                mouseOffset.set(0, 0);
+            }
+        });
+
+        window.addEventListener('mousemove', (e) => {
+            if (!isDragging) return;
+            const sensitivity = 0.003; 
+            mouseOffset.x += e.movementX * sensitivity;
+            mouseOffset.y += -e.movementY * sensitivity;
+
+            if (mouseOffset.length() > CONFIG.maxDisplacement) {
+                mouseOffset.setLength(CONFIG.maxDisplacement);
+            }
+        });
+
+        window.addEventListener('mouseup', () => {
+            isDragging = false;
+            mouseOffset.set(0, 0);
+        });
+
+        animate();
+    }
+
+    function updateRaycaster(e, raycaster) {
+        const ndc = new THREE.Vector2(
+            (e.clientX / window.innerWidth) * 2 - 1,
+            -(e.clientY / window.innerHeight) * 2 + 1
+        );
+        raycaster.setFromCamera(ndc, camera);
+    }
+
+    function animate() {
+        requestAnimationFrame(animate);
+
+        // 物理計算
+        const forceX = (mouseOffset.x - physicsPos.x) * CONFIG.tension;
+        const forceY = (mouseOffset.y - physicsPos.y) * CONFIG.tension;
+
+        physicsVel.x += forceX;
+        physicsVel.y += forceY;
+        physicsVel.x *= CONFIG.friction;
+        physicsVel.y *= CONFIG.friction;
+
+        physicsPos.x += physicsVel.x;
+        physicsPos.y += physicsVel.y;
+
+        material.uniforms.uOffset.value.copy(physicsPos);
+        renderer.render(scene, camera);
+    }
+</script>
+</body>
+</html>
